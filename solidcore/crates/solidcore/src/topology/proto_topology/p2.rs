@@ -93,10 +93,17 @@
 //!   fork's tangency-labs/smlib@9eec159); upstream keeps the edge whole past that vertex.
 //! - **Opt-in fix (WR-580, #1519).** With `Kernel::fixes.imprint_reuses_coincident_face_edge`,
 //!   [`ProtoTopologyManager::imprint_edge_definition`] takes an edge either B-rep's face
-//!   already has between the definition's two vertices along its curve
-//!   ([`ProtoBrep::face_coincident_edge`], `SmTools::FindCoincidentEdge`) as the
-//!   definition's edge there instead of making a second one (the SMLib fork's
-//!   tangency-labs/smlib@81cd61a for Brep2; Brep1 likewise, solidcore's own).
+//!   already has between the definition's two vertices along its curve as the definition's
+//!   edge there instead of making a second one (the SMLib fork's tangency-labs/smlib@81cd61a
+//!   for Brep2; Brep1 likewise, solidcore's own). The fork accepts the edge on
+//!   `SmTools::FindCoincidentEdge`'s sampled deviation; here that search
+//!   ([`ProtoBrep::face_coincident_edge`]) only finds the candidate, which is taken only when
+//!   a closed-form bound of the curve's largest distance to the edge's own piece, every
+//!   rounding included, is within the tolerance (`curve_along_edge_bound`: two lines, or two
+//!   circular or elliptic arcs); for two arcs, a piece of the curve past an end of the edge's
+//!   piece is not counted when it is proved inside that end vertex's ball (the vertex's
+//!   tolerance about its point, which the edge and the curve both end at). Other pairs are
+//!   not reused.
 //! - **Not upstream (WR-619, #1794; own design).**
 //!   [`ProtoTopologyManager::imprint_edge_definition`] makes no edge for a definition whose ends
 //!   are one proto vertex and one vertex in each B-rep, along a speck within that vertex's
@@ -125,11 +132,14 @@
 //!   edge, which upstream dereferences, is [`SolidError::InvalidInput`].
 //! - **Recursion.** None.
 
+use core::f64::consts::{FRAC_PI_2, PI, TAU};
+
 use crate::curve::curve::p1::GlobalPointSolveOptions;
-use crate::curve::curve::p2::Curve;
 use crate::curve::curve::p2::BSPLINE_CURVE_TYPE;
+use crate::curve::curve::p2::{Curve, CurveKind};
 use crate::error::EntityRef;
 use crate::error::{passed_on, Result, SolidError};
+use crate::geom::certified::{above, Bounded};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
 use crate::geom::global_solver::{SolutionRequested, SolverOperation};
@@ -145,7 +155,7 @@ use crate::kernel::Kernel;
 use crate::math::{max2, max3, max4, min2, Point2, Point3, Vec3, EFF_ZERO};
 use crate::nurbs::b_spline_curve_n_lib::TrimMode;
 use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
-use crate::nurbs::math::gamma;
+use crate::nurbs::math::{gamma, UNIT};
 use crate::query::face::p2::proto_vertex_containment_radius;
 use crate::surface::surface::exact_pieces::{common_trim_interval, trim_unsnapped};
 use crate::topology::brep::p5::{make_edge_in_face_in, EdgeInFace};
@@ -238,7 +248,8 @@ pub trait ProtoBrep<O>: ProtoGeometry<O> + ProtoTopology<O> {
     /// `Kernel::fixes.imprint_reuses_coincident_face_edge`): `SmTools::FindCoincidentEdge`
     /// over `face`'s edges (`SmFace::GetEdges`) for an edge between `start` and `end` whose
     /// geometry lies along `curve` over `interval` within `tolerance`. Returns the first
-    /// such edge and its sampled maximum deviation.
+    /// such edge and its sampled maximum deviation. The deviation is sampled and proves
+    /// nothing: the caller takes the edge only on a derived bound (`curve_along_edge_bound`).
     ///
     /// # Errors
     ///
@@ -555,6 +566,532 @@ fn speck_on_vertex(
     let start_pt = curve.evaluate_point(k, interval.min())?;
     let end_pt = curve.evaluate_point(k, interval.max())?;
     Ok(Some((max_gap, start_pt, end_pt)))
+}
+
+/// Not upstream (WR-580): how far from orthonormal, as computed (`|x.x - 1|`, `|y.y - 1|`,
+/// `|x.y|`), the axes of an ellipse's placement may be for [`curve_along_edge_bound`] to
+/// read them as orthonormal. `Axis2Placement::new` makes them so to a few roundings.
+const AXIS_DEFECT: f64 = 16.0 * UNIT;
+
+/// Not upstream (WR-580): the ball of a vertex, the point it stands for being within `tol`
+/// of `point` (`docs/validity-and-tolerances.md` §1).
+#[derive(Debug, Clone, Copy)]
+struct VertexBall {
+    point: Point3,
+    tol: f64,
+}
+
+/// Not upstream (WR-580): an upper bound of the largest distance from a point of `curve`
+/// over `interval` to the edge whose geometry is `edge_curve` over `edge_interval` (the
+/// edge's own piece, not the whole curve), taken over the curve's points that are not
+/// proved inside an end vertex's ball, as a [`Bounded`]: that largest distance is at most
+/// `value + bound`, so [`Bounded::at_most`] answers `Yes` only when it is proved within the
+/// tolerance. `balls` are the balls of the vertices at the curve's start and end (`None`
+/// for a vertex without a tolerance), each one of the edge's two vertices. `None` when it
+/// proves nothing: the pairs it reads are two lines and two ellipses (circles included);
+/// every other pair is refused.
+///
+/// The balls are the tolerant model's (`docs/validity-and-tolerances.md` §1 and §9 item 6):
+/// the edge reaches each of its vertices within `τ_e + τ_v`, and the curve's end there is
+/// that same vertex, so a point of the curve past an end of the edge's arc and within that
+/// end vertex's tolerance of its point lies in the vertex's ball, where the edge ends. Such
+/// points are not counted; every other point is within the bound of the edge's own arc.
+///
+/// Decided on closed forms, never on samples:
+///
+/// - **Two lines.** The distance from a point to a segment is convex, so its largest value
+///   over a segment is at one of that segment's ends: the larger of the distances from the
+///   curve's two ends ([`crate::curve::line::Line::segment_over`]) to the edge's segment
+///   ([`segment_distance`]), each end moved by twice its coordinates' error. The balls are
+///   not read: every point counts, measured to the segment.
+/// - **Two ellipses.** Each is its analytic definition `c + rx cos t x + ry sin t y` over
+///   the parameters its interval covers, the curve's arc widened and the edge's narrowed
+///   by the most those parameters can be off ([`ellipse_arc`]); the bound is the smaller
+///   of two closed forms, each proved for every point of the arcs.
+///
+/// **The circle bound** (arcs of nearly the same circle). Read the curve as the circle A
+/// of radius `ra = (rx + ry) / 2`, within `slack_A = |rx - ry| / 2` of the ellipse at
+/// every `t`, and the edge likewise as B (`rb`, `slack_B`). With `w = cA - cB`,
+/// `nB = xB x yB`, the tilt `s = sqrt((xA.nB)^2 + (yA.nB)^2)`, `w_p = w - (w.nB) nB`: the
+/// height of A's point at `t` over B's plane is at most `H = |w.nB| + ra s`, and its
+/// distance from B's axis is within `ra s` of `sigma(t) = |w_p + ra (cos t xA + sin t yA)|
+/// = sqrt(|w_p|^2 + ra^2 + 2 ra (a cos t + b sin t))`, `a = w_p.xA`, `b = w_p.yA`. Over
+/// the arc, `a cos t + b sin t` takes its extremes at the arc's ends, and `+-|(a, b)|` at
+/// `atan2(b, a)` and the opposite angle when those are on the arc (taken when within the
+/// angle margin: that only loosens the bound). So every point of A is within
+/// `D = sqrt(H^2 + R^2)` of the circle B, `R = max(|sigma_max - rb|, |sigma_min - rb|) +
+/// ra s`. Restricted to B's arc: a point whose foot on B (the nearest point of B's circle)
+/// is on the arc is within `D` of the arc. Any foot is within half the rest of the circle,
+/// `(2 pi - sweep_B) / 2`, of an end, so every point is within `D + rb (2 pi - sweep_B) / 2`
+/// of the arc. Tighter: the circles are required near (tilt at most 1/64, `|w.nB|`,
+/// `|w_p|` and `|ra - rb|` at most `ra / 16`), so `|w_p| < ra |nA.nB|` and the feet move
+/// monotonically along A, one way round (`d(foot)/dt` has the sign of `nA.nB`). The feet
+/// of A's arc then sweep one arc of B's circle, placed from the feet of A's two ends and
+/// its middle; where it passes B's end Q, the points of A whose feet are past Q form one
+/// piece of A ending at A's end there, and their distance to B's arc is at most their
+/// distance to Q. That distance squared is a sinusoid in `t`, largest at the point of A
+/// opposite Q, so when that point is not on A's arc the piece's largest distance is at
+/// its ends: the end gap `|A(end) - Q|`, and `D` at the point whose foot is Q itself (or
+/// the gap of A's other end when A's whole arc is past Q). Whichever holds, it is also
+/// at most `D + rb (excess)`, the foot moving along B by at most the excess angle of the
+/// end's foot past Q. Each end of B's arc adds the smaller of the two; an end whose foot
+/// is on the arc adds nothing. The bound is the smaller of the two restrictions, plus
+/// `slack_A + slack_B`.
+///
+/// **The vertex ball** at an end Q of B's arc that the feet pass. The piece of A past Q
+/// runs from A's end there to the point whose foot is Q; the ball is that of the vertex at
+/// A's end there (`v`, `τ_v`), read only when `v` is within `2 rb` of B's centre (so its
+/// terms are of the size `S` below). The squared distance from `v` to A's point at `t` is a
+/// sinusoid in `t` too, largest at the point of A farthest from `v`; when that point is not
+/// on A's arc (within the angle margin, and `v`'s distance from A's axis in A's plane at
+/// least `ra / 2` for the angle to be placed), the piece's largest distance from `v` is at
+/// its ends: `|A(end) - v|` (and `|A(other end) - v|` when A's whole arc may be past Q),
+/// and at most `D + |Q - v|` at the point whose foot is Q, which is within `D` of Q. With
+/// `slack_A` for the ellipse and `8 E` for the rounding, a largest distance proved below
+/// `τ_v` puts the whole piece in the ball: that end adds nothing beyond `D`. Otherwise
+/// (no ball, a tolerance that is not a finite number, or not proved) it adds as above.
+///
+/// **The chord bound** (short arcs, any two ellipses). The arc of a unit circle over a
+/// sweep `d <= pi` and its chord are within `1 - cos(d / 2)` of each other both ways (along
+/// the chord's normal, from each point of one to a point of the other); the ellipse is the
+/// image of that circle under `(cos t, sin t) -> rx cos t x + ry sin t y`, which stretches
+/// no vector more than `max(rx, ry)`, so each arc is within its sagitta
+/// `max(rx, ry) (1 - cos(d / 2)) = 2 max(rx, ry) sin^2(d / 4)` of its chord both ways. A
+/// point of A is then within `sag_A` of A's chord, whose points are within the larger
+/// distance of its two ends to B's chord (convex), whose points are within `sag_B` of B:
+/// the bound is `sag_A + max(dist(A0, B0 B1), dist(A1, B0 B1)) + sag_B`. A sweep over
+/// `pi` proves nothing here. It does not read the balls: it counts every point.
+///
+/// Rounding (§4.4 of `docs/definitions-and-certificates.md`): every length and coordinate
+/// above is computed relative to B's centre from `w` (one rounding per coordinate), the
+/// radii, the axes (orthonormal within [`AXIS_DEFECT`], checked) and the cosines and sines
+/// of double parameters (two roundings each), along at most 32 operations on terms at most
+/// `S = |w| + rx_A + ry_A + rx_B + ry_B` long, and the axes' defect moves each term by at
+/// most 40 u of its size: 72 roundings of the terms' size, counted as `E = gamma_80 4 S`
+/// for each (a root of `sigma`'s radicand, at least `(ra / 2)^2`, adds no more than its
+/// radicand's relative error). The returned bound is `8 E`: the largest term, the slacks
+/// and the subtractions that compare them. The angles decided on are `atan2` of vectors at least
+/// `ra / 2` long whose coordinates are within `E`, so within `8 E / ra` of exact, plus 64 u
+/// for `atan2` and the differences: the margin every angle comparison widens by, the side
+/// that loosens the bound.
+///
+/// # Errors
+///
+/// Those of the evaluations of the ellipses' ends.
+fn curve_along_edge_bound(
+    k: &Kernel,
+    curve: &Curve,
+    interval: Extent1d,
+    edge_curve: &Curve,
+    edge_interval: Extent1d,
+    balls: [Option<VertexBall>; 2],
+) -> Result<Option<Bounded>> {
+    match (curve.kind(), edge_curve.kind()) {
+        (CurveKind::Line(a), CurveKind::Line(b)) => {
+            Ok(line_along_line(a, interval, b, edge_interval))
+        }
+        (CurveKind::Ellipse(_), CurveKind::Ellipse(_)) => {
+            let Some(a) = ellipse_arc(k, curve, interval, true)? else {
+                return Ok(None);
+            };
+            let Some(b) = ellipse_arc(k, edge_curve, edge_interval, false)? else {
+                return Ok(None);
+            };
+            Ok(arc_along_arc(&a, &b, balls))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Not upstream (WR-580): the line bound of [`curve_along_edge_bound`]: the larger of the
+/// distances from the ends of `a` over `ia` to the segment of `b` over `ib`, with their
+/// rounding and twice each end's coordinate error (`sqrt 3 < 2`) as the bound.
+fn line_along_line(
+    a: &crate::curve::line::Line,
+    ia: Extent1d,
+    b: &crate::curve::line::Line,
+    ib: Extent1d,
+) -> Option<Bounded> {
+    let [(p0, e0), (p1, e1)] = a.segment_over(&ia)?;
+    let [(q0, f0), (q1, f1)] = b.segment_over(&ib)?;
+    let (g0, r0) = segment_distance(p0, q0, q1);
+    let (g1, r1) = segment_distance(p1, q0, q1);
+    let value = max2(g0, g1);
+    let bound = max2(r0, r1) + 2.0 * (max2(e0, e1) + max2(f0, f1));
+    (value.is_finite() && bound.is_finite()).then_some(Bounded { value, bound })
+}
+
+/// Not upstream (WR-580): the distance from `p` to the segment `q0 q1` as computed, and the
+/// bound of its rounding. The foot's parameter is limited to `[0, 1]`, so the point it
+/// measures to is on the segment whatever the parameter's rounding, and its distance is at
+/// least the segment's; `v = p - q0` and `d = q1 - q0` round once each (by `u` of their
+/// length), `t d` twice more, `v - t d` once, and the length as [`certified::distance`]'s
+/// (`gamma_5`): within `gamma_8 (|r| + |v| + 2 |d|)`, `r = v - t d`.
+///
+/// [`certified::distance`]: crate::geom::certified::distance
+fn segment_distance(p: Point3, q0: Point3, q1: Point3) -> (f64, f64) {
+    let v = p - q0;
+    let d = q1 - q0;
+    let dd = d.dot(d);
+    // a NaN parameter is 0: q0 is on the segment too
+    let t = if dd > 0.0 {
+        min2(max2(v.dot(d) / dd, 0.0), 1.0)
+    } else {
+        0.0
+    };
+    let r = v - t * d;
+    let r_len = r.length();
+    (r_len, gamma(8) * (r_len + v.length() + 2.0 * d.length()))
+}
+
+/// Not upstream (WR-580): an arc of the ellipse `centre + rx cos t x + ry sin t y` over the
+/// parameters `t` from `start` to `start + sweep` (radians; a sweep of at least `TAU` is
+/// the whole ellipse), as [`curve_along_edge_bound`] reads it.
+#[derive(Debug, Clone, Copy)]
+struct EllipseArc {
+    centre: Point3,
+    x: Vec3,
+    y: Vec3,
+    rx: f64,
+    ry: f64,
+    start: f64,
+    sweep: f64,
+}
+
+impl EllipseArc {
+    /// Whether the arc is the whole ellipse.
+    fn whole(&self) -> bool {
+        self.sweep >= TAU
+    }
+
+    /// The last parameter.
+    fn end(&self) -> f64 {
+        self.start + self.sweep
+    }
+
+    /// The radius of the circle the circle bound reads the ellipse as.
+    fn radius(&self) -> f64 {
+        0.5 * (self.rx + self.ry)
+    }
+
+    /// The most the ellipse is from that circle at the same parameter: `|rx - r|` and
+    /// `|ry - r|` are at most `|rx - ry| / 2` and the rounding of `r`.
+    fn slack(&self) -> f64 {
+        0.5 * (self.rx - self.ry).abs() + UNIT * self.radius()
+    }
+
+    /// The point of that circle at `t`, from the centre.
+    fn circle_at(&self, t: f64) -> Vec3 {
+        self.radius() * (t.cos() * self.x + t.sin() * self.y)
+    }
+
+    /// The point of the ellipse at `t`, from the centre.
+    fn ellipse_at(&self, t: f64) -> Vec3 {
+        self.rx * t.cos() * self.x + self.ry * t.sin() * self.y
+    }
+
+    /// Whether `t` is within `margin` of the arc's parameters (true for a NaN).
+    fn near(&self, t: f64, margin: f64) -> bool {
+        let d = (t - self.start).rem_euclid(TAU);
+        self.whole() || !(d > self.sweep + margin && d < TAU - margin)
+    }
+}
+
+/// Not upstream (WR-580): the arc of the ellipse `curve` over `interval` (its own
+/// parameters) for [`curve_along_edge_bound`], its parameter range widened (`widen`) or
+/// narrowed by the most it can be off, so that the widened arc holds the curve's and the
+/// narrowed one lies on it. `None` for another kind, an ellipse it cannot read (radii not
+/// positive, axes off orthonormal by more than [`AXIS_DEFECT`]), an interval past the
+/// curve's natural one (where the B-spline is not the ellipse), or ends it cannot place.
+///
+/// The ellipse is its analytic definition, of which its B-spline is the rational form
+/// (`curve/ellipse.rs`); the interval's ends are placed on it from evaluated points. The
+/// parameter of a point `v` from the centre is `atan2(rx (v.y), ry (v.x))`; the arc runs
+/// from the start point's parameter through the middle point's to the end point's (the
+/// whole ellipse, widened, when the start and end points meet). A point within `e` of the
+/// ellipse's point at its computed parameter `t` (its residual, plus the rounding of the
+/// evaluation and of the residual: `gamma_32` of four times the coordinates' size `|c| +
+/// 2 max(rx, ry)`, the B-spline's control points lying within twice the radius of the
+/// centre) is the ellipse's point at a parameter within `(pi / 2) e / min(rx, ry)` of
+/// `t`: two points of the ellipse whose parameters are `d <= pi` apart are at least
+/// `2 min(rx, ry) sin(d / 2) >= (2 / pi) min(rx, ry) d` apart. That, and 64 u for
+/// `atan2`, the differences and the sums with the margin, is the margin each end moves by;
+/// the three parameters must be more than twice it apart to fix the arc.
+///
+/// # Errors
+///
+/// Those of the evaluations.
+fn ellipse_arc(
+    k: &Kernel,
+    curve: &Curve,
+    interval: Extent1d,
+    widen: bool,
+) -> Result<Option<EllipseArc>> {
+    let CurveKind::Ellipse(e) = curve.kind() else {
+        return Ok(None);
+    };
+    let (rx, ry) = (e.x_radius(), e.y_radius());
+    let (centre, x, y) = (
+        e.position().origin(),
+        e.position().x_axis(),
+        e.position().y_axis(),
+    );
+    let natural = curve.natural_interval();
+    let readable = rx > 0.0
+        && ry > 0.0
+        && rx.is_finite()
+        && ry.is_finite()
+        && [centre.x, centre.y, centre.z].iter().all(|c| c.is_finite())
+        && (x.dot(x) - 1.0).abs() <= AXIS_DEFECT
+        && (y.dot(y) - 1.0).abs() <= AXIS_DEFECT
+        && x.dot(y).abs() <= AXIS_DEFECT
+        && interval.min() >= natural.min()
+        && interval.max() <= natural.max()
+        && interval.min() < interval.max();
+    if !readable {
+        return Ok(None);
+    }
+    let param = |p: Point3| {
+        let v = p - centre;
+        let t = (rx * v.dot(y)).atan2(ry * v.dot(x));
+        (t, (v - (rx * t.cos() * x + ry * t.sin() * y)).length())
+    };
+    let (t0, e0) = param(curve.evaluate_point(k, interval.min())?);
+    let (tm, em) = param(curve.evaluate_point(k, interval.mid())?);
+    let (t1, e1) = param(curve.evaluate_point(k, interval.max())?);
+    let rounding = gamma(32) * 4.0 * (centre.length() + 2.0 * max2(rx, ry));
+    let residual = max2(max2(e0, em), e1) + rounding;
+    let margin = FRAC_PI_2 * residual / min2(rx, ry) * (1.0 + gamma(64)) + 64.0 * UNIT;
+    let gap = 2.0 * margin;
+    let to_end = (t1 - t0).rem_euclid(TAU);
+    let to_mid = (tm - t0).rem_euclid(TAU);
+    // the middle clear of both ends (NaN refuses), and the margin far below a degree
+    if !(to_mid > gap && to_mid < TAU - gap && (to_mid - to_end).abs() > gap && margin < 1e-3) {
+        return Ok(None);
+    }
+    let (start, sweep) = if to_mid < to_end {
+        (t0, to_end)
+    } else {
+        (t1, TAU - to_end)
+    };
+    let (start, sweep) = if widen {
+        (start - margin, sweep + 2.0 * margin)
+    } else {
+        (start + margin, sweep - 2.0 * margin)
+    };
+    if !above(sweep, 0.0) {
+        return Ok(None);
+    }
+    Ok(Some(EllipseArc {
+        centre,
+        x,
+        y,
+        rx,
+        ry,
+        start,
+        sweep,
+    }))
+}
+
+/// Not upstream (WR-580): the ellipse bound of [`curve_along_edge_bound`] for the curve's
+/// arc `a` (widened) and the edge's arc `b` (narrowed), `balls` those at `a`'s start and
+/// end: the smaller of the circle and the chord bounds, with the rounding `8 E` as its
+/// bound.
+fn arc_along_arc(
+    a: &EllipseArc,
+    b: &EllipseArc,
+    balls: [Option<VertexBall>; 2],
+) -> Option<Bounded> {
+    let w = a.centre - b.centre;
+    let err = gamma(80) * 4.0 * (w.length() + a.rx + a.ry + b.rx + b.ry);
+    let circle = circle_bound(a, b, w, err, balls).filter(|v| v.is_finite());
+    let chord = chord_bound(a, b, w).filter(|v| v.is_finite());
+    let value = match (circle, chord) {
+        (Some(c), Some(h)) => min2(c, h),
+        (Some(v), None) | (None, Some(v)) => v,
+        (None, None) => return None,
+    };
+    let bound = 8.0 * err;
+    bound.is_finite().then_some(Bounded { value, bound })
+}
+
+/// Not upstream (WR-580): the circle bound of [`curve_along_edge_bound`] (the derivation is
+/// there), without its rounding; `err` is `E`, `balls` those at `a`'s start and end. `None`
+/// when the circles are not near.
+fn circle_bound(
+    a: &EllipseArc,
+    b: &EllipseArc,
+    w: Vec3,
+    err: f64,
+    balls: [Option<VertexBall>; 2],
+) -> Option<f64> {
+    let (ra, rb) = (a.radius(), b.radius());
+    let nb = b.x.cross(b.y);
+    let wn = w.dot(nb);
+    let wp = w - wn * nb;
+    let (xn, yn) = (a.x.dot(nb), a.y.dot(nb));
+    let tilt = (xn * xn + yn * yn).sqrt();
+    let wp_len = wp.length();
+    let near = tilt <= 1.0 / 64.0
+        && wn.abs() <= ra / 16.0
+        && wp_len <= ra / 16.0
+        && (ra - rb).abs() <= ra / 16.0;
+    if !near {
+        return None;
+    }
+    let margin = 8.0 * err / ra + 64.0 * UNIT;
+
+    // Every point of A within `D` of B's circle.
+    let height = wn.abs() + ra * tilt;
+    let (pa, pb) = (wp.dot(a.x), wp.dot(a.y));
+    let g = (pa * pa + pb * pb).sqrt();
+    let peak = pb.atan2(pa);
+    let at = |t: f64| pa * t.cos() + pb * t.sin();
+    let (at_start, at_end) = (at(a.start), at(a.end()));
+    let hi = if a.near(peak, margin) {
+        g
+    } else {
+        max2(at_start, at_end)
+    };
+    let lo = if a.near(peak + PI, margin) {
+        -g
+    } else {
+        min2(at_start, at_end)
+    };
+    let base = wp_len * wp_len + ra * ra;
+    let sigma_hi = (base + 2.0 * ra * hi).sqrt();
+    let sigma_lo = (base + 2.0 * ra * lo).sqrt();
+    let radial = max2((sigma_hi - rb).abs(), (sigma_lo - rb).abs()) + ra * tilt;
+    let to_circle = height.hypot(radial);
+    let slack = a.slack() + b.slack();
+    if b.whole() {
+        return Some(to_circle + slack);
+    }
+
+    // Any foot is within half the rest of B's circle of an end of B's arc.
+    let rest = to_circle + rb * 0.5 * (TAU - b.sweep);
+    if a.whole() {
+        return Some(rest + slack);
+    }
+
+    // The feet of A's arc, in the order they move along B's circle.
+    let foot = |t: f64| {
+        let v = w + a.circle_at(t);
+        v.dot(b.y).atan2(v.dot(b.x))
+    };
+    let [ball_start, ball_end] = balls;
+    let (t_first, t_last, ball_first, ball_last) = if a.x.cross(a.y).dot(nb) > 0.0 {
+        (a.start, a.end(), ball_start, ball_end)
+    } else {
+        (a.end(), a.start, ball_end, ball_start)
+    };
+    let f_first = foot(t_first);
+    let sweep = (foot(t_last) - f_first).rem_euclid(TAU);
+    let mid = (foot(a.start + 0.5 * a.sweep) - f_first).rem_euclid(TAU);
+    // The feet from `first` to `last` relative to B's start, within half a turn of its
+    // arc's middle: before 0 is past B's start, beyond `b.sweep` past its end.
+    let half = 0.5 * b.sweep;
+    let first = (f_first - b.start - half + PI).rem_euclid(TAU) + half - PI;
+    let last = first + sweep;
+    let placed = mid > margin
+        && mid < sweep - margin
+        && first > half - PI + margin
+        && last < half + PI - margin;
+    if !placed {
+        return Some(rest + slack);
+    }
+    let gap = |t: f64, beta: f64| (w + a.circle_at(t) - b.circle_at(beta)).length();
+    // the parameter of A's point farthest from B's point at `beta`
+    let far = |beta: f64| {
+        let v = w - b.circle_at(beta);
+        v.dot(a.y).atan2(v.dot(a.x))
+    };
+    // Whether the piece of A past B's end at `beta`, from A's end `t_end` (and A's other end
+    // `t_other` when A's whole arc may be past it), is proved inside `ball`.
+    let in_ball = |ball: Option<VertexBall>, beta: f64, t_end: f64, t_other: Option<f64>| {
+        let Some(ball) = ball.filter(|found| found.tol.is_finite()) else {
+            return false;
+        };
+        let vb = ball.point - b.centre;
+        // from the vertex's point to A's centre: A's farthest point from it is that way
+        let u = w - vb;
+        let (ux, uy) = (u.dot(a.x), u.dot(a.y));
+        let placed = vb.length() <= 2.0 * rb && ux.hypot(uy) >= 0.5 * ra;
+        // a NaN refuses on either test
+        if !placed || a.near(uy.atan2(ux), margin) {
+            return false;
+        }
+        let to_v = |t: f64| (w + a.circle_at(t) - vb).length();
+        let at_foot_q = to_circle + (b.circle_at(beta) - vb).length();
+        let value = max3(to_v(t_end), at_foot_q, t_other.map_or(0.0, to_v)) + a.slack();
+        Bounded {
+            value,
+            bound: 8.0 * err,
+        }
+        .at_most(ball.tol)
+        .is_yes()
+    };
+    let mut feet = to_circle;
+    // an end whose piece is proved inside its vertex's ball adds nothing beyond `D`
+    if last > b.sweep - margin
+        && !in_ball(
+            ball_last,
+            b.end(),
+            t_last,
+            (first > b.sweep - margin).then_some(t_first),
+        )
+    {
+        let beta = b.end();
+        let left = if first > b.sweep - margin {
+            max2(to_circle, gap(t_first, beta))
+        } else {
+            to_circle
+        };
+        let sinusoid = if a.near(far(beta), margin) {
+            f64::INFINITY
+        } else {
+            max2(left, gap(t_last, beta))
+        };
+        feet = max2(
+            feet,
+            min2(sinusoid, to_circle + rb * (last - b.sweep + margin)),
+        );
+    }
+    if first < margin
+        && !in_ball(
+            ball_first,
+            b.start,
+            t_first,
+            (last < margin).then_some(t_last),
+        )
+    {
+        let beta = b.start;
+        let right = if last < margin {
+            max2(to_circle, gap(t_last, beta))
+        } else {
+            to_circle
+        };
+        let sinusoid = if a.near(far(beta), margin) {
+            f64::INFINITY
+        } else {
+            max2(right, gap(t_first, beta))
+        };
+        feet = max2(feet, min2(sinusoid, to_circle + rb * (margin - first)));
+    }
+    Some(min2(rest, feet) + slack)
+}
+
+/// Not upstream (WR-580): the chord bound of [`curve_along_edge_bound`] (the derivation is
+/// there), without its rounding; `None` when an arc sweeps more than half a turn.
+fn chord_bound(a: &EllipseArc, b: &EllipseArc, w: Vec3) -> Option<f64> {
+    if !(a.sweep <= PI && b.sweep <= PI) {
+        return None;
+    }
+    let sagitta = |c: &EllipseArc| 2.0 * max2(c.rx, c.ry) * (0.25 * c.sweep).sin().powi(2);
+    let (b0, b1) = (b.ellipse_at(b.start), b.ellipse_at(b.end()));
+    let (g0, _) = segment_distance(w + a.ellipse_at(a.start), b0, b1);
+    let (g1, _) = segment_distance(w + a.ellipse_at(a.end()), b0, b1);
+    Some(sagitta(a) + max2(g0, g1) + sagitta(b))
 }
 
 /// The curve behind `o` (a `NULL` dereference upstream for none).
@@ -1003,10 +1540,20 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
     /// Not upstream (WR-580, #1519; opt-in `fixes.imprint_reuses_coincident_face_edge`): the
     /// edge the source face of the definition `ed` in B-rep `which` already has between
     /// `start` and `end` (the definition's final vertices there) along the definition's
-    /// curve, within the larger of the face's and the definition's tolerance
-    /// ([`ProtoBrep::face_coincident_edge`], `SmTools::FindCoincidentEdge`). `None` when the
+    /// curve, within the larger of the face's and the definition's tolerance. `None` when the
     /// fix is off, the source is not a face, the two vertices are one, the definition has no
-    /// curve, or no edge of the face lies along the curve within that tolerance.
+    /// curve, or no edge of the face is proved along the curve within that tolerance.
+    ///
+    /// The sampled search ([`ProtoBrep::face_coincident_edge`], `SmTools::FindCoincidentEdge`:
+    /// the edge's middle dropped on the curve, then 30 sampled points) only finds the
+    /// candidate; it is taken only when [`curve_along_edge_bound`] proves every point of the
+    /// curve over its interval within that tolerance of the candidate's own piece, or (two
+    /// arcs) past an end of that piece and inside the ball of the vertex there (`start`'s or
+    /// `end`'s point and tolerance: the tolerant model's vertex, which the edge and the curve
+    /// both end at, `docs/validity-and-tolerances.md` §1 and §9 item 6), on closed forms for
+    /// two lines and for two circular or elliptic arcs. Any other pair, a vertex without a
+    /// tolerance where the ball is needed, or a bound it cannot prove, is no reuse: the
+    /// imprint makes its own edge, as upstream.
     ///
     /// Why: `SmEdgeDefinition::Imprint` makes a new edge with `MakeEdgeInFace` for every face
     /// source, in Brep1 (`source/SMLib/src/SmProtoTopology.cpp:1436`, the call at `:1462`)
@@ -1024,8 +1571,10 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
     ///
     /// # Errors
     ///
-    /// Those of [`ProtoBrep::face_coincident_edge`]; a missing-topology error for a face source
-    /// without a face; [`SolidError::InvalidInput`] for an unknown face handle.
+    /// Those of [`ProtoBrep::face_coincident_edge`], of the vertices' points and of the
+    /// bound's evaluations; a
+    /// missing-topology error for a face source without a face; [`SolidError::InvalidInput`]
+    /// for an unknown face handle, or a found edge without a curve or an interval.
     fn coincident_face_edge(
         &self,
         k: &Kernel,
@@ -1052,16 +1601,30 @@ impl<O: ClassObject> ProtoTopologyManager<O> {
             .topology_tolerance(face)
             .ok_or(dangling("face handle is unknown"))?;
         let along_tol = max2(face_tol, d.raw_tolerance());
-        let found = brep.face_coincident_edge(
-            k,
-            face,
-            start,
-            end,
-            curve_of(brep, Some(curve))?,
-            d.xsect_interval(),
-            along_tol,
-        )?;
-        Ok(found.and_then(|(edge, deviation)| (deviation <= along_tol).then_some(edge)))
+        let curve = curve_of(brep, Some(curve))?;
+        let interval = d.xsect_interval();
+        // the sampled search finds the candidate; only the derived bound accepts it
+        let Some((edge, _sampled)) =
+            brep.face_coincident_edge(k, face, start, end, curve, interval, along_tol)?
+        else {
+            return Ok(None);
+        };
+        let edge_curve = curve_of(brep, Some(edge_curve_of(brep, edge)?))?;
+        let edge_interval = brep
+            .edge_interval(edge)
+            .ok_or(dangling("edge handle is unknown"))?;
+        // the curve runs from `start` to `end`, the edge's two vertices
+        let ball = |v: O| -> Result<Option<VertexBall>> {
+            let point = brep.vertex_point(v)?;
+            Ok(brep
+                .topology_tolerance(v)
+                .map(|tol| VertexBall { point, tol }))
+        };
+        let balls = [ball(start)?, ball(end)?];
+        let bound = curve_along_edge_bound(k, curve, interval, edge_curve, edge_interval, balls)?;
+        Ok(bound
+            .filter(|b| b.at_most(along_tol).is_yes())
+            .map(|_| edge))
     }
 
     /// The body of [`ProtoTopologyManager::imprint_edge_definition`]; `edited` is set
@@ -4264,6 +4827,508 @@ mod tests {
         for i in 0..=64 {
             let pt = curve.evaluate_point(&k, f64::from(i) / 64.0).unwrap();
             assert!(pt.distance(vertex) <= gap);
+        }
+    }
+
+    // ---- WR-580 review: the bound that accepts a coincident face edge ----------------
+
+    /// The tolerance of the hub cases (the larger of the face's and the definition's).
+    const ALONG_TOL: f64 = 1e-5;
+
+    /// The ellipse about `centre` on the axes `x`, `y` with radii `rx`, `ry` over `from..to`
+    /// degrees.
+    fn ellipse_curve(
+        k: &Kernel,
+        centre: Point3,
+        (x, y): (Vec3, Vec3),
+        (rx, ry): (f64, f64),
+        (from, to): (f64, f64),
+    ) -> Curve {
+        use crate::curve::ellipse::{Ellipse, EllipseOptions};
+        let domain = Extent1d::from_min_max(from, to);
+        let opts = EllipseOptions::default();
+        Curve::from(Ellipse::new(k, centre, x, y, domain, rx, ry, &opts).unwrap())
+    }
+
+    /// A circle curve's centre, axes, radius and STEP domain (degrees).
+    fn circle_data(c: &Curve) -> (Point3, Vec3, Vec3, f64, Extent1d) {
+        let CurveKind::Ellipse(e) = c.kind() else {
+            panic!("not an ellipse");
+        };
+        let p = e.position();
+        let (x, y, o) = (p.x_axis(), p.y_axis(), p.origin());
+        (o, x, y, e.x_radius(), e.step_interval())
+    }
+
+    /// The angle in degrees, in `[0, 360)`, of `p` about the centre `c` on the axes `x`, `y`.
+    fn angle_about(p: Point3, c: Point3, x: Vec3, y: Vec3) -> f64 {
+        let v = p - c;
+        v.dot(y).atan2(v.dot(x)).to_degrees().rem_euclid(360.0)
+    }
+
+    /// The distance from `p` to the circular arc `edge`, in closed form: to its circle where
+    /// `p`'s angle about it is on the arc, else to the nearer end.
+    fn distance_to_arc(p: Point3, edge: &Curve) -> f64 {
+        let (c, x, y, r, dom) = circle_data(edge);
+        let v = p - c;
+        let (vx, vy, h) = (v.dot(x), v.dot(y), v.dot(x.cross(y)));
+        if (vy.atan2(vx).to_degrees() - dom.min()).rem_euclid(360.0) <= dom.length() {
+            return h.hypot(vx.hypot(vy) - r);
+        }
+        let end = |deg: f64| {
+            let t = deg.to_radians();
+            p.distance(c + r * (t.cos() * x + t.sin() * y))
+        };
+        end(dom.min()).min(end(dom.max()))
+    }
+
+    /// The largest distance from 10,001 evenly spaced points of `curve` (its own
+    /// evaluation, over its natural interval) to `distance`.
+    fn dense_max(k: &Kernel, curve: &Curve, distance: &dyn Fn(Point3) -> f64) -> f64 {
+        let ivl = curve.natural_interval();
+        (0..=10_000)
+            .map(|i| {
+                let t = ivl.evaluate(f64::from(i) / 10_000.0);
+                distance(curve.evaluate_point(k, t).unwrap())
+            })
+            .fold(0.0, f64::max)
+    }
+
+    /// [`curve_along_edge_bound`] of `curve` along `edge`, each over its natural interval,
+    /// without vertex balls.
+    fn along(k: &Kernel, curve: &Curve, edge: &Curve) -> Option<Bounded> {
+        along_with(k, curve, edge, [None, None])
+    }
+
+    /// [`curve_along_edge_bound`] of `curve` along `edge` with the balls of the vertices at
+    /// the curve's start and end.
+    fn along_with(
+        k: &Kernel,
+        curve: &Curve,
+        edge: &Curve,
+        balls: [Option<VertexBall>; 2],
+    ) -> Option<Bounded> {
+        curve_along_edge_bound(
+            k,
+            curve,
+            curve.natural_interval(),
+            edge,
+            edge.natural_interval(),
+            balls,
+        )
+        .unwrap()
+    }
+
+    /// The ends of `curve` over its natural interval.
+    fn ends_of(k: &Kernel, curve: &Curve) -> [Point3; 2] {
+        let ivl = curve.natural_interval();
+        [ivl.min(), ivl.max()].map(|t| curve.evaluate_point(k, t).unwrap())
+    }
+
+    /// The largest distance a bound allows.
+    fn upper(b: Bounded) -> f64 {
+        b.value + b.bound
+    }
+
+    /// The edge between the curve's two vertices on the circle of radius `r` about `c` on
+    /// `x`, `y`: the arc from the angle of the curve's start to that of its end, each end
+    /// moved inwards by `trim` degrees.
+    fn edge_under(
+        k: &Kernel,
+        curve: &Curve,
+        c: Point3,
+        r: f64,
+        (trim_start, trim_end): (f64, f64),
+    ) -> Curve {
+        let ivl = curve.natural_interval();
+        let from = angle_about(
+            curve.evaluate_point(k, ivl.min()).unwrap(),
+            c,
+            Vec3::X,
+            Vec3::Y,
+        );
+        let mut to = angle_about(
+            curve.evaluate_point(k, ivl.max()).unwrap(),
+            c,
+            Vec3::X,
+            Vec3::Y,
+        );
+        if to < from {
+            to += 360.0;
+        }
+        let span = (from + trim_start, to - trim_end);
+        ellipse_curve(k, c, (Vec3::X, Vec3::Y), (r, r), span)
+    }
+
+    /// The hub's top circle (radius 11 about (0, 0, 5)), the bar's end arc (radius 10.999975,
+    /// its centre 3.14e-5 off), and a measured arm (radius 10.99997467, its axes off the
+    /// plane by about 1e-16).
+    const HUB: Point3 = Point3::new(0.0, 0.0, 5.0);
+    const BAR: Point3 = Point3::new(5e-6, -3.1e-5, 5.0);
+    const BAR_R: f64 = 10.999975;
+    const ARM: Point3 = Point3::new(2.0887881489617812e-5, -2.3981662470407486e-5, 5.0);
+    const ARM_R: f64 = 10.99997467;
+    const ARM_AXES: (Vec3, Vec3) = (
+        Vec3::new(-0.2634843238498734, -0.9646636777060569, 1.2e-32),
+        Vec3::new(0.9646636777060569, -0.2634843238498734, -1.22e-16),
+    );
+
+    /// The arm's angle (degrees, in its own frame) of its point nearest outside the hub's
+    /// circle: the distance grows away from it, to 7.7e-6 at 56.3 degrees.
+    fn arm_peak() -> f64 {
+        let w = ARM - HUB;
+        w.dot(ARM_AXES.1).atan2(w.dot(ARM_AXES.0)).to_degrees()
+    }
+
+    /// WR-580 review: the three circle pairs the reuse meets in the first body (a bar's end
+    /// arc along the hub's top circle at two places, and a measured arm, whose largest
+    /// distance is at an end with about 2.3e-6 to spare) are proved within the tolerance by
+    /// a bound at or just above the largest distance of 10,001 points.
+    #[test]
+    fn nearly_coincident_circle_arcs_are_proved_along_the_edge() {
+        let k = Kernel::default();
+        let xy = (Vec3::X, Vec3::Y);
+        let peak = arm_peak();
+        for (centre, axes, r, span, sampled) in [
+            (BAR, xy, BAR_R, (236.944, 241.927), 1.745e-6),
+            (BAR, xy, BAR_R, (316.397, 320.6), 1.4595e-6),
+            (ARM, ARM_AXES, ARM_R, (peak - 56.3, peak + 10.0), 7.70e-6),
+        ] {
+            let curve = ellipse_curve(&k, centre, axes, (r, r), span);
+            let edge = edge_under(&k, &curve, HUB, 11.0, (0.0, 0.0));
+            let dense = dense_max(&k, &curve, &|p| distance_to_arc(p, &edge));
+            assert!(
+                (dense - sampled).abs() < 0.01 * sampled,
+                "{span:?}: dense {dense:e}"
+            );
+            let b = along(&k, &curve, &edge).expect("a bound");
+            assert!(
+                upper(b) >= dense && upper(b) < dense + 1e-9,
+                "{span:?}: bound {b:?}, dense {dense:e}"
+            );
+            assert!(b.at_most(ALONG_TOL).is_yes(), "{span:?}: {b:?}");
+        }
+        // the arm's largest distance is at its start
+        let curve = ellipse_curve(
+            &k,
+            ARM,
+            ARM_AXES,
+            (ARM_R, ARM_R),
+            (peak - 56.3, peak + 10.0),
+        );
+        let edge = edge_under(&k, &curve, HUB, 11.0, (0.0, 0.0));
+        let start = curve
+            .evaluate_point(&k, curve.natural_interval().min())
+            .unwrap();
+        let dense = dense_max(&k, &curve, &|p| distance_to_arc(p, &edge));
+        assert!(distance_to_arc(start, &edge) >= dense * (1.0 - 1e-9));
+    }
+
+    /// The same circles over an arc reaching 80 degrees from the arm's nearest point (2e-5
+    /// off the hub's circle there) are not proved within the tolerance, nor is the whole
+    /// circle (the centre offset plus the radius difference, about 5.7e-5); either bound
+    /// still covers the densely sampled distance.
+    #[test]
+    fn circle_arcs_apart_by_more_than_the_tolerance_are_not_proved() {
+        let k = Kernel::default();
+        let peak = arm_peak();
+        let curve = ellipse_curve(
+            &k,
+            ARM,
+            ARM_AXES,
+            (ARM_R, ARM_R),
+            (peak - 80.0, peak + 10.0),
+        );
+        let edge = edge_under(&k, &curve, HUB, 11.0, (0.0, 0.0));
+        let dense = dense_max(&k, &curve, &|p| distance_to_arc(p, &edge));
+        assert!(dense > 1.9e-5, "dense {dense:e}");
+        let b = along(&k, &curve, &edge).expect("a bound");
+        assert!(upper(b) >= dense, "bound {b:?}, dense {dense:e}");
+        assert!(!b.at_most(ALONG_TOL).is_yes());
+
+        let whole = ellipse_curve(&k, ARM, ARM_AXES, (ARM_R, ARM_R), (0.0, 360.0));
+        let circle = ellipse_curve(&k, HUB, (Vec3::X, Vec3::Y), (11.0, 11.0), (0.0, 360.0));
+        let dense = dense_max(&k, &whole, &|p| distance_to_arc(p, &circle));
+        assert!(dense > 5.6e-5, "dense {dense:e}");
+        let b = along(&k, &whole, &circle).expect("a bound");
+        assert!(upper(b) >= dense && !b.at_most(ALONG_TOL).is_yes(), "{b:?}");
+    }
+
+    /// A degree-1 B-spline through `points` at uniform parameters over `[0, 1]`.
+    fn polyline(points: &[Point3]) -> Curve {
+        use crate::nurbs::b_spline_curve::{
+            BSplineCurve, BSplineCurveForm, CanonicalData, KnotType,
+        };
+        let n = points.len();
+        let last = f64::from(u32::try_from(n - 1).unwrap());
+        let knots: Vec<f64> = (0..n)
+            .map(|i| f64::from(u32::try_from(i).unwrap()) / last)
+            .collect();
+        let mut mults = vec![1; n];
+        mults[0] = 2;
+        mults[n - 1] = 2;
+        Curve::from(
+            BSplineCurve::create_canonical(&CanonicalData {
+                dim: 3,
+                degree: 1,
+                control_points: points,
+                form: BSplineCurveForm::Unspecified,
+                knot_multiplicities: &mults,
+                knots: &knots,
+                knot_type: KnotType::Unspecified,
+                weights: None,
+                trim: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    /// WR-580 review: a curve that agrees with a straight edge at 31 evenly spaced
+    /// parameters (more than the search's 30 samples) but bows 100 tolerances off it between
+    /// them is a B-spline, of which no closed form is read: no bound, so no reuse. The
+    /// straight curve over the same span is proved.
+    #[test]
+    fn a_curve_bowing_between_samples_is_not_proved_along_an_edge() {
+        let k = Kernel::default();
+        let (p, q) = (Point3::new(1.0, 2.0, 3.0), Point3::new(11.0, 2.0, 3.0));
+        let edge = Curve::from(Line::from_points(p, q, 3));
+        let bow = Vec3::new(0.0, 100.0 * ALONG_TOL, 0.0);
+        let points: Vec<Point3> = (0..61_u32)
+            .map(|i| {
+                let on = p + (f64::from(i) / 60.0) * (q - p);
+                if i % 2 == 0 {
+                    on
+                } else {
+                    on + bow
+                }
+            })
+            .collect();
+        let curve = polyline(&points);
+        for j in 0..=30 {
+            let pt = curve.evaluate_point(&k, f64::from(j) / 30.0).unwrap();
+            assert!((pt.y - 2.0).abs() <= ALONG_TOL, "sample {j} is on the edge");
+        }
+        let between = curve.evaluate_point(&k, 1.0 / 60.0).unwrap();
+        assert!(between.y - 2.0 > 50.0 * ALONG_TOL);
+        assert_eq!(along(&k, &curve, &edge), None);
+        let straight = Curve::from(Line::from_points(p, q, 3));
+        assert!(along(&k, &straight, &edge)
+            .unwrap()
+            .at_most(ALONG_TOL)
+            .is_yes());
+    }
+
+    /// An end of the curve whose foot falls past the edge's arc: its distance to the arc is
+    /// the gap to the arc's end, which the bound covers (dense sampling of the distance to
+    /// the arc, not to its circle) and stays close to, at one end or both; with the edge a
+    /// tenth of a degree shorter the gap is far above the tolerance and the bound says so.
+    /// Vertex balls at the arc's ends too small to hold the curve's ends (1e-6 against gaps
+    /// of 3.8e-6 and more) change nothing.
+    #[test]
+    fn an_end_past_the_edge_s_arc_is_bounded_by_its_gap() {
+        let k = Kernel::default();
+        let curve = ellipse_curve(
+            &k,
+            BAR,
+            (Vec3::X, Vec3::Y),
+            (BAR_R, BAR_R),
+            (236.944, 241.927),
+        );
+        for (trim, proved) in [
+            ((0.0, 2e-5), true),
+            ((2e-5, 2e-5), true),
+            ((0.0, 0.1), false),
+        ] {
+            let edge = edge_under(&k, &curve, HUB, 11.0, trim);
+            let dense = dense_max(&k, &curve, &|p| distance_to_arc(p, &edge));
+            let b = along(&k, &curve, &edge).expect("a bound");
+            let small = ends_of(&k, &edge).map(|point| Some(VertexBall { point, tol: 1e-6 }));
+            assert_eq!(along_with(&k, &curve, &edge, small), Some(b), "{trim:?}");
+            assert!(upper(b) >= dense, "{trim:?}: bound {b:?}, dense {dense:e}");
+            assert_eq!(b.at_most(ALONG_TOL).is_yes(), proved, "{trim:?}: {b:?}");
+            if proved {
+                // the gap is the largest distance: 2e-5 degrees of radius 11, 3.8e-6
+                assert!(dense > 3.5e-6 && upper(b) < dense + 1e-9, "{trim:?}: {b:?}");
+            }
+        }
+    }
+
+    /// WR-580, a measured arm in the first body, as read at the decision: the curve's
+    /// start is 7.7e-6 inside the hub's circle and its foot falls 7.3e-6 before the edge's
+    /// arc begins, 1.0592e-5 from the arc's start (above the tolerance) but 1.0292e-5 from
+    /// the start vertex's point, inside that vertex's ball (tolerance 1.0419e-5). With that
+    /// ball the piece past the arc's start is not counted and the bound is the distance to
+    /// the hub's circle, about 7.7e-6; with a start tolerance of 1e-5 the curve's start is
+    /// outside the ball and the bound is the end gap, not within the tolerance. Every one of
+    /// 10,001 points is either inside the ball the proof used or within the bound of the
+    /// edge's arc.
+    #[test]
+    fn a_curve_end_inside_its_vertex_s_ball_is_not_counted_past_the_edge_s_arc() {
+        let k = Kernel::default();
+        let start = Point3::new(-2.8982949029935474, -10.611308941110371, 5.0);
+        let end = Point3::new(0.7394577917898549, -10.975117410495491, 5.0);
+        let arc_start = Point3::new(-2.8982950133155208, -10.611309345023846, 5.000000000000001);
+        let a0 = Point3::new(-2.8983, -10.611300000000004, 5.0);
+        let a1 = Point3::new(0.7394577908933867, -10.97511741055589, 4.999999999999999);
+        // the curve starts at its parameter 0 (A0 is 2.3e-15 degrees from it)
+        let span = (0.0, angle_about(a1, ARM, ARM_AXES.0, ARM_AXES.1));
+        let r = a0.distance(ARM);
+        let curve = ellipse_curve(&k, ARM, ARM_AXES, (r, r), span);
+        let hub_span = (
+            angle_about(arc_start, HUB, Vec3::X, Vec3::Y),
+            angle_about(end, HUB, Vec3::X, Vec3::Y),
+        );
+        let edge = ellipse_curve(&k, HUB, (Vec3::X, Vec3::Y), (11.0, 11.0), hub_span);
+        let [c0, c1] = ends_of(&k, &curve);
+        assert!(
+            c0.distance(a0) < 1e-12 && c1.distance(a1) < 1e-9,
+            "{c0:?} {c1:?}"
+        );
+        let [e0, e1] = ends_of(&k, &edge);
+        assert!(e0.distance(arc_start) < 1e-12 && e1.distance(end) < 1e-12);
+        let gap = a0.distance(arc_start);
+        assert!((gap - 1.0592e-5).abs() < 1e-9 && distance_to_arc(a0, &edge) >= gap * (1.0 - 1e-9));
+
+        let end_ball = Some(VertexBall {
+            point: end,
+            tol: 1e-5,
+        });
+        for (tol, proved) in [(1.0418708769725684e-5, true), (1e-5, false)] {
+            let start_ball = VertexBall { point: start, tol };
+            let b = along_with(&k, &curve, &edge, [Some(start_ball), end_ball]).expect("a bound");
+            assert_eq!(b.at_most(ALONG_TOL).is_yes(), proved, "{tol:e}: {b:?}");
+            let want = if proved { 7.70e-6 } else { gap };
+            assert!((upper(b) - want).abs() < 0.01 * want, "{tol:e}: {b:?}");
+            // a point counts when outside the ball the proof used
+            let in_ball = |p: Point3| proved && p.distance(start) <= tol;
+            let dense = dense_max(&k, &curve, &|p| {
+                if in_ball(p) {
+                    0.0
+                } else {
+                    distance_to_arc(p, &edge)
+                }
+            });
+            assert!(upper(b) >= dense, "{tol:e}: bound {b:?}, dense {dense:e}");
+        }
+        // the ball is needed: the curve's largest distance to the arc is the end gap
+        let dense = dense_max(&k, &curve, &|p| distance_to_arc(p, &edge));
+        assert!(
+            dense >= gap * (1.0 - 1e-9) && dense > ALONG_TOL,
+            "dense {dense:e}"
+        );
+    }
+
+    /// Circles tilted against each other (1e-16, 1e-7 and 1e-3 radians about the X axis)
+    /// and a slightly elliptic curve (radii 2e-6 apart): the bound always covers the densely
+    /// sampled distance, and proves the nearly flat ones within the tolerance.
+    #[test]
+    fn tilted_and_elliptic_arcs_are_never_under_estimated() {
+        let k = Kernel::default();
+        let span = (236.944, 241.927);
+        for (tilt, proved) in [(1e-16, true), (1e-7, true), (1e-3, false)] {
+            let axes = (Vec3::X, Vec3::new(0.0, f64::cos(tilt), f64::sin(tilt)));
+            let curve = ellipse_curve(&k, BAR, axes, (BAR_R, BAR_R), span);
+            let edge = edge_under(&k, &curve, HUB, 11.0, (0.0, 0.0));
+            let dense = dense_max(&k, &curve, &|p| distance_to_arc(p, &edge));
+            let b = along(&k, &curve, &edge).expect("a bound");
+            assert!(
+                upper(b) >= dense,
+                "tilt {tilt:e}: bound {b:?}, dense {dense:e}"
+            );
+            assert_eq!(
+                b.at_most(ALONG_TOL).is_yes(),
+                proved,
+                "tilt {tilt:e}: {b:?}"
+            );
+        }
+        let radii = (BAR_R + 1e-6, BAR_R - 1e-6);
+        let curve = ellipse_curve(&k, BAR, (Vec3::X, Vec3::Y), radii, span);
+        let edge = edge_under(&k, &curve, HUB, 11.0, (0.0, 0.0));
+        let dense = dense_max(&k, &curve, &|p| distance_to_arc(p, &edge));
+        let b = along(&k, &curve, &edge).expect("a bound");
+        assert!(
+            upper(b) >= dense && b.at_most(ALONG_TOL).is_yes(),
+            "{b:?}, dense {dense:e}"
+        );
+    }
+
+    /// The second body's pair in `wr580_tube_joint_no_coincident_edges`: a tube's oblique
+    /// end, an arc of an ellipse of radii 70.9 and 16 that is 2.2e-4 degrees long, along a
+    /// circular edge of radius 16 in another plane. The circle bound does not apply (the
+    /// radii are far apart); the chord bound proves it, each arc within its sagitta of its
+    /// chord.
+    #[test]
+    fn a_short_elliptic_arc_is_proved_along_a_circular_edge_by_its_chord() {
+        let k = Kernel::default();
+        let curve = ellipse_curve(
+            &k,
+            Point3::new(
+                -149.99838387544747,
+                -5.615027325919686e-21,
+                820.0000861938705,
+            ),
+            (
+                Vec3::new(
+                    0.960823529726481,
+                    -5.30594477700228e-16,
+                    0.27716086434405934,
+                ),
+                Vec3::new(1.2099860597824597e-16, -1.0, -2.3338532549286827e-15),
+            ),
+            (70.92324796027054, 16.0),
+            (269.99865795160713, 269.9988816139566),
+        );
+        let edge = ellipse_curve(
+            &k,
+            Point3::new(-150.0000141047361, 0.0, 819.9996159350303),
+            (
+                Vec3::new(0.7858270042010662, 0.5754056122601738, 0.22668105533518287),
+                Vec3::new(-0.5528632513962465, 0.8178681931579774, -0.1594799168424551),
+            ),
+            (16.0, 16.0),
+            (54.87083919449955, 54.871830623122456),
+        );
+        let dense = dense_max(&k, &curve, &|p| distance_to_arc(p, &edge));
+        let b = along(&k, &curve, &edge).expect("a bound");
+        assert!(
+            upper(b) >= dense && upper(b) < 1e-7,
+            "bound {b:?}, dense {dense:e}"
+        );
+        assert!(b.at_most(ALONG_TOL).is_yes());
+    }
+
+    /// The closed-form distance from `p` to the segment `q0 q1`.
+    fn to_segment(p: Point3, q0: Point3, q1: Point3) -> f64 {
+        let d = q1 - q0;
+        let t = ((p - q0).dot(d) / d.dot(d)).clamp(0.0, 1.0);
+        p.distance(q0 + t * d)
+    }
+
+    /// Two lines: the bound is the larger distance of the curve's ends to the edge's segment
+    /// (the distance to a segment is convex), so it covers the densely sampled distance and
+    /// is that distance to rounding; a curve longer than the edge by twice the tolerance is
+    /// not proved.
+    #[test]
+    fn two_lines_are_bounded_at_the_curve_s_ends() {
+        let k = Kernel::default();
+        let (p0, p1) = (Point3::new(1.0, 2.0, 3.0), Point3::new(11.0, 2.0, 3.0));
+        let curve = Curve::from(Line::from_points(p0, p1, 3));
+        for (q0, q1, proved) in [
+            (
+                Point3::new(1.0, 2.0 + 2e-6, 3.0),
+                Point3::new(11.0, 2.0 - 1e-6, 3.0 + 3e-6),
+                true,
+            ),
+            (p0, Point3::new(11.0 - 2e-5, 2.0, 3.0), false),
+        ] {
+            let edge = Curve::from(Line::from_points(q0, q1, 3));
+            let dense = dense_max(&k, &curve, &|p| to_segment(p, q0, q1));
+            let b = along(&k, &curve, &edge).expect("a bound");
+            assert!(
+                upper(b) >= dense && upper(b) < dense + 1e-12,
+                "{b:?}, dense {dense:e}"
+            );
+            assert_eq!(b.at_most(ALONG_TOL).is_yes(), proved, "{b:?}");
         }
     }
 }
